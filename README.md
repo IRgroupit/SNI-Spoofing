@@ -15,6 +15,8 @@
 - cleanup قطعی Socket و Connection در همه مسیرهای خطا
 - اعتبارسنجی کامل `config.json` قبل از اجرای Driver
 - لاگ استاندارد و بدون ثبت Payload کاربران
+- Route pool تطبیقی با failover، least-loaded selection و circuit breaker
+- پشتیبانی از چند Upstream و چند Decoy SNI با حفظ تنظیمات قدیمی
 - تست Regression و CI ویندوز روی Python 3.10 تا 3.13
 
 ## پیش‌نیازها
@@ -38,13 +40,17 @@ py main.py
 {
   "LISTEN_HOST": "0.0.0.0",
   "LISTEN_PORT": 40443,
-  "CONNECT_IP": "188.114.98.0",
-  "CONNECT_PORT": 443,
+  "UPSTREAMS": [
+    {"IP": "188.114.98.0", "PORT": 443}
+  ],
   "FAKE_SNIS": ["aparat.com"],
   "BYPASS_METHOD": "wrong_seq",
   "CONNECT_TIMEOUT_SECONDS": 5,
   "INJECTION_TIMEOUT_SECONDS": 2,
   "IDLE_TIMEOUT_SECONDS": 180,
+  "MAX_ROUTE_ATTEMPTS": 3,
+  "ROUTE_FAILURE_THRESHOLD": 2,
+  "ROUTE_COOLDOWN_SECONDS": 30,
   "RELAY_BUFFER_SIZE": 131072,
   "MAX_CONNECTIONS": 2048,
   "MAX_CONNECTIONS_PER_IP": 64,
@@ -53,9 +59,19 @@ py main.py
 }
 ```
 
+تنظیمات قدیمی `CONNECT_IP` و `CONNECT_PORT` همچنان پشتیبانی می‌شوند. وقتی `UPSTREAMS` وجود داشته باشد، مسیرهای جدید از آن ساخته می‌شوند.
+
+### Failover تطبیقی
+
+برنامه از ترکیب هر عضو `UPSTREAMS` با هر عضو `FAKE_SNIS` یک Route Profile می‌سازد. انتخاب مسیر به‌شکل round-robin بین کم‌بارترین مسیرهای سالم انجام می‌شود. خطاهای اتصال یا Injection به‌صورت passive ثبت می‌شوند و بعد از `ROUTE_FAILURE_THRESHOLD` شکست متوالی، مسیر برای `ROUTE_COOLDOWN_SECONDS` وارد cooldown می‌شود. هر اتصال جدید حداکثر `MAX_ROUTE_ATTEMPTS` مسیر متفاوت را قبل از بستن Client امتحان می‌کند.
+
+برای failover واقعی باید حداقل دو Endpoint معتبر یا دو پروفایل تست‌شده داشته باشید. تنظیم پیش‌فرض فقط یک Upstream و یک SNI دارد و طبیعتاً مسیر جایگزین ایجاد نمی‌کند. IP تصادفی Cloudflare اضافه نکنید؛ هر Upstream باید واقعاً سرویس مقصد شما را terminate کند.
+
 ### نکته مهم درباره Aparat و Cloudflare
 
-`aparat.com` در این تنظیمات فقط **Decoy SNI داخل ClientHello جعلی** است. این دامنه IP تمیز Cloudflare نیست و مالکیت یا ارتباطی با این پروژه ندارد. مقصد TCP همچنان مقدار `CONNECT_IP` است. برای تشخیص Cloudflare بودن IP فقط از [فهرست رسمی IPهای Cloudflare](https://www.cloudflare.com/ips/) استفاده کنید.
+`aparat.com` در این تنظیمات فقط **Decoy SNI داخل ClientHello جعلی** است. این دامنه IP تمیز Cloudflare نیست و مالکیت یا ارتباطی با این پروژه ندارد. مقصد TCP از `UPSTREAMS` انتخاب می‌شود. برای تشخیص Cloudflare بودن IP فقط از [فهرست رسمی IPهای Cloudflare](https://www.cloudflare.com/ips/) استفاده کنید.
+
+این برنامه به‌تنهایی VPN یا اینترنت عمومی ایجاد نمی‌کند؛ یک TCP relay به Endpointهای مشخص است. برای دسترسی عمومی، Endpoint انتخابی باید Backend مجاز و واقعی Tunnel/Proxy شما را ارائه کند. Decoy SNI جای Backend را نمی‌گیرد.
 
 ### هشدار Listener عمومی
 
@@ -73,23 +89,19 @@ py -m unittest discover -s tests -v
 
 ## معماری فعلی
 
-```text
-Client TCP
-    │
-    ▼
-Async relay ──► Outbound socket ──► Fixed upstream
-                     │
-                     ▼
-              WinDivert injector
-                     │
-                     ▼
-          Thread-safe connection registry
+```mermaid
+flowchart LR
+    Client[Client TCP] --> Relay[Async relay]
+    Relay --> Pool[Adaptive route pool]
+    Pool --> Upstream[Selected upstream]
+    Pool --> Injector[WinDivert injector]
+    Injector --> Registry[Thread-safe registry]
 ```
 
 ## مسیر توسعه
 
 1. تست میدانی کنترل‌شده و ثبت فقط Metricهای غیرشخصی
-2. Health check و انتخاب پروفایل بر اساس نرخ موفقیت
+2. Metricهای محلی برای نرخ موفقیت، latency و cooldown هر Route
 3. Windows Service و Release امضاشده
 4. جداسازی Data Plane برای پیاده‌سازی سریع‌تر و چندسکویی
 5. Backend مستقل برای Linux/OpenWrt و Android

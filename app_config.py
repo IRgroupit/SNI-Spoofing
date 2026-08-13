@@ -12,26 +12,50 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class UpstreamEndpoint:
+    ip: str
+    port: int
+
+    @property
+    def label(self) -> str:
+        return f"{self.ip}:{self.port}"
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     listen_host: str
     listen_port: int
-    connect_ip: str
-    connect_port: int
+    upstreams: tuple[UpstreamEndpoint, ...]
     fake_snis: tuple[str, ...]
     bypass_method: str
     connect_timeout_seconds: float
     injection_timeout_seconds: float
     idle_timeout_seconds: float
+    max_route_attempts: int
+    route_failure_threshold: int
+    route_cooldown_seconds: float
     relay_buffer_size: int
     max_connections: int
     max_connections_per_ip: int
     listen_backlog: int
     log_level: str
 
+    @property
+    def connect_ip(self) -> str:
+        """Compatibility alias for deployments still using one upstream."""
+
+        return self.upstreams[0].ip
+
+    @property
+    def connect_port(self) -> int:
+        """Compatibility alias for deployments still using one upstream."""
+
+        return self.upstreams[0].port
+
     @classmethod
     def from_mapping(cls, raw: dict[str, Any]) -> AppConfig:
         listen_host = _ipv4(raw, "LISTEN_HOST")
-        connect_ip = _ipv4(raw, "CONNECT_IP")
+        upstreams = _upstreams(raw)
 
         legacy_sni = raw.get("FAKE_SNI")
         sni_values = raw.get("FAKE_SNIS", [legacy_sni] if legacy_sni else None)
@@ -41,6 +65,8 @@ class AppConfig:
         fake_snis = tuple(_hostname(value, "FAKE_SNIS") for value in sni_values)
         if len(set(fake_snis)) != len(fake_snis):
             raise ConfigError("FAKE_SNIS must not contain duplicates")
+        if len(upstreams) * len(fake_snis) > 256:
+            raise ConfigError("UPSTREAMS x FAKE_SNIS must not exceed 256 route profiles")
 
         bypass_method = raw.get("BYPASS_METHOD", "wrong_seq")
         if bypass_method != "wrong_seq":
@@ -62,13 +88,21 @@ class AppConfig:
         return cls(
             listen_host=listen_host,
             listen_port=_integer(raw, "LISTEN_PORT", None, 1, 65535),
-            connect_ip=connect_ip,
-            connect_port=_integer(raw, "CONNECT_PORT", None, 1, 65535),
+            upstreams=upstreams,
             fake_snis=fake_snis,
             bypass_method=bypass_method,
             connect_timeout_seconds=_number(raw, "CONNECT_TIMEOUT_SECONDS", 5.0, 0.1, 60.0),
             injection_timeout_seconds=_number(raw, "INJECTION_TIMEOUT_SECONDS", 2.0, 0.1, 30.0),
             idle_timeout_seconds=_number(raw, "IDLE_TIMEOUT_SECONDS", 180.0, 5.0, 86400.0),
+            max_route_attempts=_integer(raw, "MAX_ROUTE_ATTEMPTS", 3, 1, 64),
+            route_failure_threshold=_integer(raw, "ROUTE_FAILURE_THRESHOLD", 2, 1, 100),
+            route_cooldown_seconds=_number(
+                raw,
+                "ROUTE_COOLDOWN_SECONDS",
+                30.0,
+                1.0,
+                3600.0,
+            ),
             relay_buffer_size=_integer(raw, "RELAY_BUFFER_SIZE", 65536, 4096, 1024 * 1024),
             max_connections=max_connections,
             max_connections_per_ip=max_connections_per_ip,
@@ -92,6 +126,38 @@ def load_config(path: str | Path) -> AppConfig:
     if not isinstance(raw, dict):
         raise ConfigError("config.json root must be a JSON object")
     return AppConfig.from_mapping(raw)
+
+
+def _upstreams(raw: dict[str, Any]) -> tuple[UpstreamEndpoint, ...]:
+    values = raw.get("UPSTREAMS")
+    if values is None:
+        return (
+            UpstreamEndpoint(
+                ip=_ipv4(raw, "CONNECT_IP"),
+                port=_integer(raw, "CONNECT_PORT", None, 1, 65535),
+            ),
+        )
+
+    if not isinstance(values, list) or not values:
+        raise ConfigError("UPSTREAMS must be a non-empty JSON array")
+    if len(values) > 64:
+        raise ConfigError("UPSTREAMS must not contain more than 64 endpoints")
+
+    endpoints: list[UpstreamEndpoint] = []
+    for index, value in enumerate(values):
+        if not isinstance(value, dict):
+            raise ConfigError(f"UPSTREAMS[{index}] must be a JSON object")
+        endpoints.append(
+            UpstreamEndpoint(
+                ip=_ipv4(value, "IP"),
+                port=_integer(value, "PORT", 443, 1, 65535),
+            )
+        )
+
+    result = tuple(endpoints)
+    if len(set(result)) != len(result):
+        raise ConfigError("UPSTREAMS must not contain duplicate IP/port pairs")
+    return result
 
 
 def _ipv4(raw: dict[str, Any], key: str) -> str:

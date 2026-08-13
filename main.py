@@ -8,25 +8,15 @@ import sys
 import threading
 from pathlib import Path
 
-from app_config import AppConfig, ConfigError, load_config
+from app_config import AppConfig, ConfigError, UpstreamEndpoint, load_config
 from connection_limits import ConnectionLimiter
 from connection_registry import ConnectionRegistry
 from fake_tcp import FakeInjectiveConnection, FakeTcpInjector
+from route_pool import RoutePool, RouteProfile
 from utils.network_tools import close_socket, configure_tcp_socket, get_default_interface_ipv4
 from utils.packet_templates import ClientHelloMaker
 
 LOGGER = logging.getLogger("sni_spoofing")
-
-
-class SniSelector:
-    def __init__(self, hostnames: tuple[str, ...]) -> None:
-        self._hostnames = hostnames
-        self._index = 0
-
-    def next(self) -> str:
-        value = self._hostnames[self._index]
-        self._index = (self._index + 1) % len(self._hostnames)
-        return value
 
 
 async def relay_one_way(
@@ -102,29 +92,25 @@ class GatewayServer:
             config.max_connections,
             config.max_connections_per_ip,
         )
-        self.sni_selector = SniSelector(config.fake_snis)
+        self.route_pool = RoutePool(
+            config.upstreams,
+            config.fake_snis,
+            failure_threshold=config.route_failure_threshold,
+            cooldown_seconds=config.route_cooldown_seconds,
+        )
         self.tasks: set[asyncio.Task[None]] = set()
 
-    async def handle(
+    async def _open_route(
         self,
-        incoming_sock: socket.socket,
-        remote_address: tuple[str, int],
-    ) -> None:
-        client_ip = remote_address[0]
-        if not self.limiter.try_acquire(client_ip):
-            LOGGER.warning("Connection limit reached for client %s", client_ip)
-            close_socket(incoming_sock)
-            return
-
+        route: RouteProfile,
+    ) -> socket.socket:
         outgoing_sock: socket.socket | None = None
         injective_connection: FakeInjectiveConnection | None = None
         try:
-            configure_tcp_socket(incoming_sock)
-            fake_sni = self.sni_selector.next()
             fake_data = ClientHelloMaker.get_client_hello_with(
                 os.urandom(32),
                 os.urandom(32),
-                fake_sni.encode("ascii"),
+                route.fake_sni.encode("ascii"),
                 os.urandom(32),
             )
 
@@ -137,12 +123,11 @@ class GatewayServer:
             injective_connection = FakeInjectiveConnection(
                 outgoing_sock,
                 self.interface_ipv4,
-                self.config.connect_ip,
+                route.upstream.ip,
                 source_port,
-                self.config.connect_port,
+                route.upstream.port,
                 fake_data,
                 self.config.bypass_method,
-                incoming_sock,
             )
             self.registry.add(injective_connection)
 
@@ -150,7 +135,7 @@ class GatewayServer:
             await asyncio.wait_for(
                 loop.sock_connect(
                     outgoing_sock,
-                    (self.config.connect_ip, self.config.connect_port),
+                    (route.upstream.ip, route.upstream.port),
                 ),
                 timeout=self.config.connect_timeout_seconds,
             )
@@ -165,6 +150,67 @@ class GatewayServer:
 
             injective_connection.deactivate()
             self.registry.discard(injective_connection.id)
+            return outgoing_sock
+        except BaseException:
+            if injective_connection is not None:
+                injective_connection.deactivate()
+                self.registry.discard(injective_connection.id)
+            close_socket(outgoing_sock)
+            raise
+
+    async def handle(
+        self,
+        incoming_sock: socket.socket,
+        remote_address: tuple[str, int],
+    ) -> None:
+        client_ip = remote_address[0]
+        if not self.limiter.try_acquire(client_ip):
+            LOGGER.warning("Connection limit reached for client %s", client_ip)
+            close_socket(incoming_sock)
+            return
+
+        outgoing_sock: socket.socket | None = None
+        active_route: RouteProfile | None = None
+        try:
+            configure_tcp_socket(incoming_sock)
+            attempted_routes: set[RouteProfile] = set()
+            last_route_error: BaseException | None = None
+            attempts = min(
+                self.config.max_route_attempts,
+                self.route_pool.profile_count,
+            )
+            for attempt in range(1, attempts + 1):
+                route = self.route_pool.acquire(attempted_routes)
+                if route is None:
+                    break
+                attempted_routes.add(route)
+                active_route = route
+                try:
+                    outgoing_sock = await self._open_route(route)
+                except (ConnectionError, OSError, TimeoutError, ValueError) as exc:
+                    last_route_error = exc
+                    entered_cooldown = self.route_pool.record_failure(route)
+                    self.route_pool.release(route)
+                    active_route = None
+                    LOGGER.warning(
+                        "Route attempt %d/%d failed for %s%s: %s",
+                        attempt,
+                        attempts,
+                        route.label,
+                        "; entering cooldown" if entered_cooldown else "",
+                        exc,
+                    )
+                    continue
+
+                self.route_pool.record_success(route)
+                LOGGER.debug("Selected route %s after %d attempt(s)", route.label, attempt)
+                break
+
+            if outgoing_sock is None:
+                raise ConnectionError(
+                    f"All route attempts failed: {last_route_error or 'no route available'}"
+                )
+
             await relay_bidirectional(
                 incoming_sock,
                 outgoing_sock,
@@ -178,9 +224,8 @@ class GatewayServer:
         except Exception:
             LOGGER.exception("Unhandled connection error for %s:%s", *remote_address)
         finally:
-            if injective_connection is not None:
-                injective_connection.deactivate()
-                self.registry.discard(injective_connection.id)
+            if active_route is not None:
+                self.route_pool.release(active_route)
             close_socket(outgoing_sock)
             close_socket(incoming_sock)
             self.limiter.release(client_ip)
@@ -193,11 +238,10 @@ class GatewayServer:
         listener.listen(self.config.listen_backlog)
 
         LOGGER.info(
-            "Listening on %s:%d and forwarding to %s:%d via %s",
+            "Listening on %s:%d with %d adaptive routes via %s",
             self.config.listen_host,
             self.config.listen_port,
-            self.config.connect_ip,
-            self.config.connect_port,
+            self.route_pool.profile_count,
             self.interface_ipv4,
         )
         if self.config.listen_host == "0.0.0.0":
@@ -228,12 +272,20 @@ def get_executable_directory() -> Path:
     return Path(__file__).resolve().parent
 
 
-def build_windivert_filter(interface_ipv4: str, connect_ip: str) -> str:
-    return (
-        "tcp and ((ip.SrcAddr == "
-        f"{interface_ipv4} and ip.DstAddr == {connect_ip}) or "
-        f"(ip.SrcAddr == {connect_ip} and ip.DstAddr == {interface_ipv4}))"
-    )
+def build_windivert_filter(
+    interface_ipv4: str,
+    upstreams: tuple[UpstreamEndpoint, ...],
+) -> str:
+    route_filters = []
+    for upstream in dict.fromkeys(upstreams):
+        route_filters.append(
+            "((ip.SrcAddr == "
+            f"{interface_ipv4} and ip.DstAddr == {upstream.ip} and "
+            f"tcp.DstPort == {upstream.port}) or "
+            f"(ip.SrcAddr == {upstream.ip} and ip.DstAddr == {interface_ipv4} and "
+            f"tcp.SrcPort == {upstream.port}))"
+        )
+    return f"tcp and ({' or '.join(route_filters)})"
 
 
 def configure_logging(level: str) -> None:
@@ -261,7 +313,7 @@ def run() -> int:
 
     registry: ConnectionRegistry[FakeInjectiveConnection] = ConnectionRegistry()
     injector = FakeTcpInjector(
-        build_windivert_filter(interface_ipv4, config.connect_ip),
+        build_windivert_filter(interface_ipv4, config.upstreams),
         registry,
     )
     injector_thread = threading.Thread(

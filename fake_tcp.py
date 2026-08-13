@@ -29,7 +29,6 @@ class FakeInjectiveConnection(MonitorConnection):
         dst_port: int,
         fake_data: bytes,
         bypass_method: str,
-        peer_sock: socket.socket,
     ) -> None:
         super().__init__(sock, src_ip, dst_ip, src_port, dst_port)
         self.fake_data = fake_data
@@ -38,7 +37,6 @@ class FakeInjectiveConnection(MonitorConnection):
         self.t2a_event = asyncio.Event()
         self.t2a_msg = ""
         self.bypass_method = bypass_method
-        self.peer_sock = peer_sock
         self.running_loop = asyncio.get_running_loop()
 
     def signal_asyncio(self, message: str) -> None:
@@ -140,7 +138,6 @@ class FakeTcpInjector(TcpInjector):
     ) -> None:
         connection.monitor = False
         close_socket(connection.sock)
-        close_socket(connection.peer_sock)
         connection.signal_asyncio(reason)
 
     def _on_unexpected_packet(
