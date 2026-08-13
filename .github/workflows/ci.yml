@@ -1,9 +1,9 @@
 name: CI
 
 on:
-  push:
-    branches: [main, "agent/**"]
-  pull_request:
+  # Intentionally manual while the project is under active iteration to avoid
+  # consuming repository Actions minutes on every web-editor commit.
+  workflow_dispatch:
 
 permissions:
   contents: read
