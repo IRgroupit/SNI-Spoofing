@@ -1,37 +1,40 @@
-import sys
+from __future__ import annotations
+
+import logging
+import threading
 from abc import ABC, abstractmethod
 
-from pydivert import WinDivert, Packet
+from pydivert import Packet, WinDivert
 
-
-# from pydivert.consts import *
+LOGGER = logging.getLogger(__name__)
 
 
 class TcpInjector(ABC):
-    def __init__(self, w_filter: str):
-        # self.interface_ipv4 = interface_ipv4
-        # self.interface_ipv6 = interface_ipv6
-        # ip_filter = ip4_filter = ip6_filter = ""
-        # if self.interface_ipv4:
-        #     ip4_filter = "(ip.SrcAddr == " + self.interface_ipv4 + " or ip.DstAddr == " + self.interface_ipv4 + ")"
-        #     ip_filter = ip4_filter
-        # if self.interface_ipv6:
-        #     ip6_filter = "(ipv6.SrcAddr == " + self.interface_ipv6 + " or ipv6.DstAddr == " + self.interface_ipv6 + ")"
-        #     ip_filter = ip6_filter
-        # if self.interface_ipv4 and self.interface_ipv6:
-        #     ip_filter = "(" + ip4_filter + " or " + ip6_filter + ")"
-        #
-        # self.filter = "tcp"
-        # if ip_filter:
-        #     self.filter += " and " + ip_filter
+    def __init__(self, w_filter: str) -> None:
         self.w: WinDivert = WinDivert(w_filter)
+        self.ready = threading.Event()
+        self.startup_error: BaseException | None = None
 
     @abstractmethod
-    def inject(self, packet: Packet):
-        sys.exit("Not implemented")
+    def inject(self, packet: Packet) -> None:
+        raise NotImplementedError
 
-    def run(self):
-        with self.w:
-            while True:
-                packet = self.w.recv(65575)
-                self.inject(packet)
+    def run(self) -> None:
+        try:
+            with self.w:
+                self.ready.set()
+                while True:
+                    packet = self.w.recv(65535)
+                    try:
+                        self.inject(packet)
+                    except Exception:
+                        # Fail open: an internal error must not silently blackhole traffic.
+                        LOGGER.exception("Unhandled packet injector error; passing packet through")
+                        try:
+                            self.w.send(packet, False)
+                        except Exception:
+                            LOGGER.exception("Failed to pass packet through after injector error")
+        except BaseException as exc:
+            self.startup_error = exc
+            self.ready.set()
+            LOGGER.exception("WinDivert injector stopped")
