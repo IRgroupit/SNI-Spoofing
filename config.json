@@ -4,19 +4,18 @@
   "ALLOWED_CLIENT_CIDRS": [
     "0.0.0.0/0"
   ],
-  "UPSTREAMS": [
+  "ROUTES": [
     {
       "IP": "188.114.98.0",
-      "PORT": 443
+      "PORT": 443,
+      "FAKE_SNI": "aparat.com"
     }
-  ],
-  "FAKE_SNIS": [
-    "aparat.com"
   ],
   "BYPASS_METHOD": "wrong_seq",
   "CONNECT_TIMEOUT_SECONDS": 5,
   "INJECTION_TIMEOUT_SECONDS": 2,
   "IDLE_TIMEOUT_SECONDS": 180,
+  "SHUTDOWN_GRACE_SECONDS": 30,
   "MAX_ROUTE_ATTEMPTS": 3,
   "ROUTE_FAILURE_THRESHOLD": 2,
   "ROUTE_COOLDOWN_SECONDS": 30,

@@ -16,9 +16,13 @@
 - اعتبارسنجی کامل `config.json` قبل از اجرای Driver
 - لاگ استاندارد و بدون ثبت Payload کاربران
 - Route pool تطبیقی با failover، least-loaded selection و circuit breaker
-- پشتیبانی از چند Upstream و چند Decoy SNI با حفظ تنظیمات قدیمی
+- Routeهای صریح برای جفت‌کردن دقیق هر Upstream با Decoy SNI خودش
+- حفظ سازگاری با تنظیمات قدیمی چند Upstream و چند Decoy SNI
 - انتخاب مسیر با EWMA latency، exploration دوره‌ای و امتیاز reliability/load
 - cooldown نمایی برای جلوگیری از retry storm هنگام قطعی مسیر
+- تشخیص source interface مجزا برای هر Upstream و ساخت فیلتر دقیق WinDivert
+- graceful drain اتصال‌های فعال هنگام خاموش‌شدن برنامه
+- بررسی Config و Route بدون بالا آوردن Driver با `--check-config`
 - Client CIDR allowlist و metricهای تجمیعی بدون Payload یا IP کاربر
 - تست Regression و CI ویندوز روی Python 3.10 تا 3.13
 
@@ -44,14 +48,14 @@ py main.py
   "LISTEN_HOST": "0.0.0.0",
   "LISTEN_PORT": 40443,
   "ALLOWED_CLIENT_CIDRS": ["0.0.0.0/0"],
-  "UPSTREAMS": [
-    {"IP": "188.114.98.0", "PORT": 443}
+  "ROUTES": [
+    {"IP": "188.114.98.0", "PORT": 443, "FAKE_SNI": "aparat.com"}
   ],
-  "FAKE_SNIS": ["aparat.com"],
   "BYPASS_METHOD": "wrong_seq",
   "CONNECT_TIMEOUT_SECONDS": 5,
   "INJECTION_TIMEOUT_SECONDS": 2,
   "IDLE_TIMEOUT_SECONDS": 180,
+  "SHUTDOWN_GRACE_SECONDS": 30,
   "MAX_ROUTE_ATTEMPTS": 3,
   "ROUTE_FAILURE_THRESHOLD": 2,
   "ROUTE_COOLDOWN_SECONDS": 30,
@@ -67,19 +71,32 @@ py main.py
 }
 ```
 
-تنظیمات قدیمی `CONNECT_IP` و `CONNECT_PORT` همچنان پشتیبانی می‌شوند. وقتی `UPSTREAMS` وجود داشته باشد، مسیرهای جدید از آن ساخته می‌شوند.
+هر عضو `ROUTES` یک پروفایل مستقل و قطعی است؛ یعنی `IP`، `PORT` و `FAKE_SNI` فقط با همان جفت استفاده می‌شوند. این مدل برای چند Endpoint جلوی ترکیب ناخواسته‌ی SNI یک Route با IP مسیر دیگر را می‌گیرد.
+
+تنظیمات قدیمی `CONNECT_IP`/`CONNECT_PORT`/`FAKE_SNI` و همچنین `UPSTREAMS`/`FAKE_SNIS` همچنان پشتیبانی می‌شوند. در مدل قدیمی، برنامه برای سازگاری از ضرب دکارتی Upstreamها و SNIها Route می‌سازد. `ROUTES` را نباید هم‌زمان با کلیدهای قدیمی استفاده کنید.
+
+قبل از اجرا می‌توانید Config، Routeهای مقصد و source interface انتخاب‌شده توسط سیستم‌عامل را بدون راه‌اندازی WinDivert بررسی کنید:
+
+```powershell
+py main.py --check-config
+py main.py --config C:\SNI-Spoofing\config.json --check-config
+```
 
 ### Failover تطبیقی
 
-برنامه از ترکیب هر عضو `UPSTREAMS` با هر عضو `FAKE_SNIS` یک Route Profile می‌سازد. انتخاب مسیر با ترکیب تعداد اتصال فعال، EWMA زمان connect/injection و نرخ موفقیت انجام می‌شود. یک exploration کنترل‌شده هم مانع starvation مسیرهای کم‌استفاده می‌شود.
+انتخاب بین اعضای `ROUTES` با ترکیب تعداد اتصال فعال، EWMA زمان connect/injection و نرخ موفقیت انجام می‌شود. یک exploration کنترل‌شده هم مانع starvation مسیرهای کم‌استفاده می‌شود.
 
 خطاهای اتصال یا Injection به‌صورت passive ثبت می‌شوند. بعد از `ROUTE_FAILURE_THRESHOLD` شکست متوالی، circuit مسیر باز می‌شود. cooldown از `ROUTE_COOLDOWN_SECONDS` شروع می‌شود و در شکست‌های half-open تا سقف `ROUTE_MAX_COOLDOWN_SECONDS` به‌صورت نمایی افزایش پیدا می‌کند. وقتی همه مسیرها در cooldown هستند، اتصال fail-fast می‌شود تا retry storm ایجاد نشود. هر Client حداکثر `MAX_ROUTE_ATTEMPTS` مسیر متفاوت را امتحان می‌کند.
 
-برای failover واقعی باید حداقل دو Endpoint معتبر یا دو پروفایل تست‌شده داشته باشید. تنظیم پیش‌فرض فقط یک Upstream و یک SNI دارد و طبیعتاً مسیر جایگزین ایجاد نمی‌کند. IP تصادفی Cloudflare اضافه نکنید؛ هر Upstream باید واقعاً سرویس مقصد شما را terminate کند.
+برای failover واقعی باید حداقل دو Route معتبر و تست‌شده داشته باشید. تنظیم پیش‌فرض فقط یک Route دارد و طبیعتاً مسیر جایگزین ایجاد نمی‌کند. IP تصادفی Cloudflare اضافه نکنید؛ هر Upstream باید واقعاً سرویس مقصد شما را terminate کند.
+
+برای سیستم‌های چند NIC، VPN یا چند default route، source IPv4 هر Upstream جداگانه از جدول Route ویندوز تشخیص داده می‌شود. Socket خروجی و clause متناظر WinDivert دقیقاً از همان interface استفاده می‌کنند.
+
+هنگام توقف برنامه، Listener بلافاصله بسته می‌شود اما اتصال‌های در حال عبور تا `SHUTDOWN_GRACE_SECONDS` فرصت تکمیل دارند؛ بعد از آن فقط کارهای باقی‌مانده لغو و Socketهایشان پاک‌سازی می‌شوند. مقدار `0` خاموش‌شدن فوری را فعال می‌کند.
 
 ### نکته مهم درباره Aparat و Cloudflare
 
-`aparat.com` در این تنظیمات فقط **Decoy SNI داخل ClientHello جعلی** است. این دامنه IP تمیز Cloudflare نیست و مالکیت یا ارتباطی با این پروژه ندارد. مقصد TCP از `UPSTREAMS` انتخاب می‌شود. برای تشخیص Cloudflare بودن IP فقط از [فهرست رسمی IPهای Cloudflare](https://www.cloudflare.com/ips/) استفاده کنید.
+`aparat.com` در این تنظیمات فقط **Decoy SNI داخل ClientHello جعلی** است. این دامنه IP تمیز Cloudflare نیست و مالکیت یا ارتباطی با این پروژه ندارد. مقصد TCP از `ROUTES[].IP` انتخاب می‌شود. برای تشخیص Cloudflare بودن IP فقط از [فهرست رسمی IPهای Cloudflare](https://www.cloudflare.com/ips/) استفاده کنید.
 
 این برنامه به‌تنهایی VPN یا اینترنت عمومی ایجاد نمی‌کند؛ یک TCP relay به Endpointهای مشخص است. برای دسترسی عمومی، Endpoint انتخابی باید Backend مجاز و واقعی Tunnel/Proxy شما را ارائه کند. Decoy SNI جای Backend را نمی‌گیرد.
 
@@ -103,6 +120,8 @@ py main.py
 هر `METRICS_INTERVAL_SECONDS` ثانیه یک رکورد `gateway_metrics` در Log نوشته می‌شود: تعداد اتصال فعال/پذیرفته/ردشده و وضعیت هر Route شامل success، failure، cooldown و EWMA latency. Payload، SNI واقعی کاربر یا IP Client در این رکورد ذخیره نمی‌شود. مقدار `0` گزارش دوره‌ای را غیرفعال می‌کند.
 
 ## تست توسعه
+
+CI فعلاً برای کنترل مصرف GitHub Actions فقط به‌صورت دستی (`workflow_dispatch`) اجرا می‌شود. تا قبل از فعال‌سازی دوباره، تست‌های زیر باید قبل از هر Commit به‌صورت محلی اجرا شوند.
 
 ```powershell
 py -m pip install -r requirements.txt -r requirements-dev.txt

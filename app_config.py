@@ -23,16 +23,26 @@ class UpstreamEndpoint:
 
 
 @dataclass(frozen=True, slots=True)
+class RouteConfig:
+    upstream: UpstreamEndpoint
+    fake_sni: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.upstream.label} via {self.fake_sni}"
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     listen_host: str
     listen_port: int
     allowed_client_cidrs: tuple[IPv4Network, ...]
-    upstreams: tuple[UpstreamEndpoint, ...]
-    fake_snis: tuple[str, ...]
+    routes: tuple[RouteConfig, ...]
     bypass_method: str
     connect_timeout_seconds: float
     injection_timeout_seconds: float
     idle_timeout_seconds: float
+    shutdown_grace_seconds: float
     max_route_attempts: int
     route_failure_threshold: int
     route_cooldown_seconds: float
@@ -45,6 +55,18 @@ class AppConfig:
     max_connections_per_ip: int
     listen_backlog: int
     log_level: str
+
+    @property
+    def upstreams(self) -> tuple[UpstreamEndpoint, ...]:
+        """Return unique endpoints in route declaration order."""
+
+        return tuple(dict.fromkeys(route.upstream for route in self.routes))
+
+    @property
+    def fake_snis(self) -> tuple[str, ...]:
+        """Compatibility view of unique SNI values in declaration order."""
+
+        return tuple(dict.fromkeys(route.fake_sni for route in self.routes))
 
     @property
     def connect_ip(self) -> str:
@@ -61,18 +83,7 @@ class AppConfig:
     @classmethod
     def from_mapping(cls, raw: dict[str, Any]) -> AppConfig:
         listen_host = _ipv4(raw, "LISTEN_HOST")
-        upstreams = _upstreams(raw)
-
-        legacy_sni = raw.get("FAKE_SNI")
-        sni_values = raw.get("FAKE_SNIS", [legacy_sni] if legacy_sni else None)
-        if not isinstance(sni_values, list) or not sni_values:
-            raise ConfigError("FAKE_SNIS must be a non-empty JSON array")
-
-        fake_snis = tuple(_hostname(value, "FAKE_SNIS") for value in sni_values)
-        if len(set(fake_snis)) != len(fake_snis):
-            raise ConfigError("FAKE_SNIS must not contain duplicates")
-        if len(upstreams) * len(fake_snis) > 256:
-            raise ConfigError("UPSTREAMS x FAKE_SNIS must not exceed 256 route profiles")
+        routes = _routes(raw)
 
         bypass_method = raw.get("BYPASS_METHOD", "wrong_seq")
         if bypass_method != "wrong_seq":
@@ -109,12 +120,18 @@ class AppConfig:
             listen_host=listen_host,
             listen_port=_integer(raw, "LISTEN_PORT", None, 1, 65535),
             allowed_client_cidrs=_ipv4_networks(raw),
-            upstreams=upstreams,
-            fake_snis=fake_snis,
+            routes=routes,
             bypass_method=bypass_method,
             connect_timeout_seconds=_number(raw, "CONNECT_TIMEOUT_SECONDS", 5.0, 0.1, 60.0),
             injection_timeout_seconds=_number(raw, "INJECTION_TIMEOUT_SECONDS", 2.0, 0.1, 30.0),
             idle_timeout_seconds=_number(raw, "IDLE_TIMEOUT_SECONDS", 180.0, 5.0, 86400.0),
+            shutdown_grace_seconds=_number(
+                raw,
+                "SHUTDOWN_GRACE_SECONDS",
+                30.0,
+                0.0,
+                300.0,
+            ),
             max_route_attempts=_integer(raw, "MAX_ROUTE_ATTEMPTS", 3, 1, 64),
             route_failure_threshold=_integer(raw, "ROUTE_FAILURE_THRESHOLD", 2, 1, 100),
             route_cooldown_seconds=route_cooldown_seconds,
@@ -179,6 +196,65 @@ def _ipv4_networks(raw: dict[str, Any]) -> tuple[IPv4Network, ...]:
         networks.append(network)
 
     return tuple(ipaddress.collapse_addresses(networks))
+
+
+def _routes(raw: dict[str, Any]) -> tuple[RouteConfig, ...]:
+    values = raw.get("ROUTES")
+    if "ROUTES" in raw:
+        conflicting_keys = tuple(
+            key
+            for key in ("UPSTREAMS", "CONNECT_IP", "CONNECT_PORT", "FAKE_SNIS", "FAKE_SNI")
+            if key in raw
+        )
+        if conflicting_keys:
+            raise ConfigError(
+                "ROUTES cannot be combined with legacy routing keys: " + ", ".join(conflicting_keys)
+            )
+        if not isinstance(values, list) or not values:
+            raise ConfigError("ROUTES must be a non-empty JSON array")
+        if len(values) > 256:
+            raise ConfigError("ROUTES must not contain more than 256 route profiles")
+
+        routes: list[RouteConfig] = []
+        for index, value in enumerate(values):
+            if not isinstance(value, dict):
+                raise ConfigError(f"ROUTES[{index}] must be a JSON object")
+            try:
+                route = RouteConfig(
+                    upstream=UpstreamEndpoint(
+                        ip=_ipv4(value, "IP"),
+                        port=_integer(value, "PORT", 443, 1, 65535),
+                    ),
+                    fake_sni=_hostname(value.get("FAKE_SNI"), "FAKE_SNI"),
+                )
+            except ConfigError as exc:
+                raise ConfigError(f"Invalid ROUTES[{index}]: {exc}") from exc
+            routes.append(route)
+
+        result = tuple(routes)
+        if len(set(result)) != len(result):
+            raise ConfigError("ROUTES must not contain duplicate route profiles")
+        return result
+
+    upstreams = _upstreams(raw)
+    fake_snis = _fake_snis(raw)
+    if len(upstreams) * len(fake_snis) > 256:
+        raise ConfigError("UPSTREAMS x FAKE_SNIS must not exceed 256 route profiles")
+    return tuple(
+        RouteConfig(upstream, fake_sni) for upstream in upstreams for fake_sni in fake_snis
+    )
+
+
+def _fake_snis(raw: dict[str, Any]) -> tuple[str, ...]:
+    legacy_sni = raw.get("FAKE_SNI")
+    values = raw.get("FAKE_SNIS", [legacy_sni] if legacy_sni else None)
+    if not isinstance(values, list) or not values:
+        raise ConfigError("FAKE_SNIS must be a non-empty JSON array")
+
+    result = tuple(_hostname(value, "FAKE_SNIS") for value in values)
+    if len(set(result)) != len(result):
+        raise ConfigError("FAKE_SNIS must not contain duplicates")
+    return result
 
 
 def _upstreams(raw: dict[str, Any]) -> tuple[UpstreamEndpoint, ...]:

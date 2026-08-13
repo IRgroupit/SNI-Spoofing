@@ -1,23 +1,29 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
 import os
+import signal
 import socket
 import sys
 import threading
 import time
+from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from app_config import AppConfig, ConfigError, UpstreamEndpoint, load_config
 from client_allowlist import ClientAllowlist
 from connection_limits import ConnectionLimiter
 from connection_registry import ConnectionRegistry
-from fake_tcp import FakeInjectiveConnection, FakeTcpInjector
 from route_pool import RoutePool, RouteProfile
 from utils.network_tools import close_socket, configure_tcp_socket, get_default_interface_ipv4
 from utils.packet_templates import ClientHelloMaker
+
+if TYPE_CHECKING:
+    from fake_tcp import FakeInjectiveConnection
 
 LOGGER = logging.getLogger("sni_spoofing")
 
@@ -81,15 +87,46 @@ async def relay_bidirectional(
             LOGGER.error("Unexpected relay error: %r", result)
 
 
+async def drain_tasks(
+    tasks: Collection[asyncio.Task[None]],
+    grace_seconds: float,
+) -> tuple[int, int]:
+    """Let active tasks finish, then cancel only the tasks that exceed the grace period."""
+
+    if grace_seconds < 0:
+        raise ValueError("grace_seconds must not be negative")
+
+    active_tasks = {task for task in tasks if not task.done()}
+    if not active_tasks:
+        return 0, 0
+
+    if grace_seconds > 0:
+        completed, pending = await asyncio.wait(active_tasks, timeout=grace_seconds)
+    else:
+        completed, pending = set(), active_tasks
+
+    cancellation_count = sum(task.cancel() for task in pending)
+    await asyncio.gather(*active_tasks, return_exceptions=True)
+    return len(completed), cancellation_count
+
+
 class GatewayServer:
     def __init__(
         self,
         config: AppConfig,
-        interface_ipv4: str,
+        interface_by_upstream: Mapping[UpstreamEndpoint, str],
         registry: ConnectionRegistry[FakeInjectiveConnection],
     ) -> None:
         self.config = config
-        self.interface_ipv4 = interface_ipv4
+        self.interface_by_upstream = dict(interface_by_upstream)
+        missing_interfaces = tuple(
+            upstream
+            for upstream in config.upstreams
+            if not self.interface_by_upstream.get(upstream)
+        )
+        if missing_interfaces:
+            labels = ", ".join(upstream.label for upstream in missing_interfaces)
+            raise ValueError(f"Missing outbound interface for: {labels}")
         self.registry = registry
         self.client_allowlist = ClientAllowlist(config.allowed_client_cidrs)
         self.limiter = ConnectionLimiter(
@@ -97,8 +134,7 @@ class GatewayServer:
             config.max_connections_per_ip,
         )
         self.route_pool = RoutePool(
-            config.upstreams,
-            config.fake_snis,
+            config.routes,
             failure_threshold=config.route_failure_threshold,
             cooldown_seconds=config.route_cooldown_seconds,
             max_cooldown_seconds=config.route_max_cooldown_seconds,
@@ -115,8 +151,11 @@ class GatewayServer:
         self,
         route: RouteProfile,
     ) -> socket.socket:
+        from fake_tcp import FakeInjectiveConnection
+
         outgoing_sock: socket.socket | None = None
         injective_connection: FakeInjectiveConnection | None = None
+        interface_ipv4 = self.interface_by_upstream[route.upstream]
         try:
             fake_data = ClientHelloMaker.get_client_hello_with(
                 os.urandom(32),
@@ -128,12 +167,12 @@ class GatewayServer:
             outgoing_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             outgoing_sock.setblocking(False)
             configure_tcp_socket(outgoing_sock)
-            outgoing_sock.bind((self.interface_ipv4, 0))
+            outgoing_sock.bind((interface_ipv4, 0))
             source_port = outgoing_sock.getsockname()[1]
 
             injective_connection = FakeInjectiveConnection(
                 outgoing_sock,
-                self.interface_ipv4,
+                interface_ipv4,
                 route.upstream.ip,
                 source_port,
                 route.upstream.port,
@@ -298,11 +337,11 @@ class GatewayServer:
         listener.listen(self.config.listen_backlog)
 
         LOGGER.info(
-            "Listening on %s:%d with %d adaptive routes via %s",
+            "Listening on %s:%d with %d adaptive routes across %d outbound interface(s)",
             self.config.listen_host,
             self.config.listen_port,
             self.route_pool.profile_count,
-            self.interface_ipv4,
+            len(set(self.interface_by_upstream.values())),
         )
         if self.config.listen_host == "0.0.0.0":
             LOGGER.warning(
@@ -331,13 +370,79 @@ class GatewayServer:
                 task.add_done_callback(self.tasks.discard)
         finally:
             close_socket(listener)
-            active_tasks = tuple(self.tasks)
-            for task in active_tasks:
-                task.cancel()
-            await asyncio.gather(*active_tasks, return_exceptions=True)
             if metrics_task is not None:
                 metrics_task.cancel()
                 await asyncio.gather(metrics_task, return_exceptions=True)
+            active_tasks = tuple(self.tasks)
+            if active_tasks:
+                LOGGER.info(
+                    "Draining %d active connection(s) for up to %.1f seconds",
+                    len(active_tasks),
+                    self.config.shutdown_grace_seconds,
+                )
+                completed, cancelled = await drain_tasks(
+                    active_tasks,
+                    self.config.shutdown_grace_seconds,
+                )
+                LOGGER.info(
+                    "Connection drain finished: completed=%d force_cancelled=%d",
+                    completed,
+                    cancelled,
+                )
+
+
+async def serve_until_shutdown(
+    server: GatewayServer,
+    shutdown_event: asyncio.Event | None = None,
+) -> None:
+    """Stop accepting on a console signal while allowing the server to drain clients."""
+
+    loop = asyncio.get_running_loop()
+    manages_signals = shutdown_event is None
+    if shutdown_event is None:
+        shutdown_event = asyncio.Event()
+
+    previous_handlers: dict[int, object] = {}
+
+    def request_shutdown(_signum: int, _frame: object) -> None:
+        loop.call_soon_threadsafe(shutdown_event.set)
+
+    if manages_signals:
+        for signal_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+            signal_number = getattr(signal, signal_name, None)
+            if signal_number is None or signal_number in previous_handlers:
+                continue
+            try:
+                previous_handlers[signal_number] = signal.getsignal(signal_number)
+                signal.signal(signal_number, request_shutdown)
+            except (OSError, RuntimeError, ValueError):
+                previous_handlers.pop(signal_number, None)
+
+    server_task = asyncio.create_task(server.serve_forever(), name="gateway-server")
+    shutdown_task = asyncio.create_task(shutdown_event.wait(), name="shutdown-waiter")
+    try:
+        done, _ = await asyncio.wait(
+            (server_task, shutdown_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if shutdown_task in done and not server_task.done():
+            LOGGER.info("Shutdown requested")
+            server_task.cancel()
+            await asyncio.gather(server_task, return_exceptions=True)
+            return
+        await server_task
+    except asyncio.CancelledError:
+        server_task.cancel()
+        await asyncio.gather(server_task, return_exceptions=True)
+        raise
+    finally:
+        shutdown_task.cancel()
+        await asyncio.gather(shutdown_task, return_exceptions=True)
+        for signal_number, previous_handler in previous_handlers.items():
+            try:
+                signal.signal(signal_number, previous_handler)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                LOGGER.debug("Could not restore signal handler %s", signal_number)
 
 
 def get_executable_directory() -> Path:
@@ -346,12 +451,43 @@ def get_executable_directory() -> Path:
     return Path(__file__).resolve().parent
 
 
-def build_windivert_filter(
-    interface_ipv4: str,
+def resolve_upstream_interfaces(
     upstreams: tuple[UpstreamEndpoint, ...],
-) -> str:
-    route_filters = []
+    resolver: Callable[[str, int], str] | None = None,
+) -> dict[UpstreamEndpoint, str]:
+    """Resolve the source IPv4 selected by the OS route table for each endpoint."""
+
+    if not upstreams:
+        raise ValueError("upstreams must not be empty")
+    if resolver is None:
+        resolver = get_default_interface_ipv4
+
+    result: dict[UpstreamEndpoint, str] = {}
     for upstream in dict.fromkeys(upstreams):
+        try:
+            interface_ipv4 = resolver(upstream.ip, upstream.port)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not determine the outbound IPv4 interface for {upstream.label}: {exc}"
+            ) from exc
+        if not interface_ipv4:
+            raise RuntimeError(
+                f"Could not determine the outbound IPv4 interface for {upstream.label}"
+            )
+        result[upstream] = interface_ipv4
+    return result
+
+
+def build_windivert_filter(
+    interface_by_upstream: Mapping[UpstreamEndpoint, str],
+) -> str:
+    if not interface_by_upstream:
+        raise ValueError("interface_by_upstream must not be empty")
+
+    route_filters = []
+    for upstream, interface_ipv4 in interface_by_upstream.items():
+        if not interface_ipv4:
+            raise ValueError(f"Missing outbound interface for {upstream.label}")
         route_filters.append(
             "((ip.SrcAddr == "
             f"{interface_ipv4} and ip.DstAddr == {upstream.ip} and "
@@ -369,25 +505,56 @@ def configure_logging(level: str) -> None:
     )
 
 
-def run() -> int:
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Hardened SNI-Spoofing TCP relay")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Path to config.json (default: next to the executable)",
+    )
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="Validate configuration and route interfaces without starting WinDivert",
+    )
+    return parser
+
+
+def run(argv: Sequence[str] | None = None) -> int:
+    args = build_argument_parser().parse_args(argv)
+    config_path = args.config or (get_executable_directory() / "config.json")
     try:
-        config = load_config(get_executable_directory() / "config.json")
+        config = load_config(config_path)
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
 
     configure_logging(config.log_level)
-    interface_ipv4 = get_default_interface_ipv4(
-        config.connect_ip,
-        config.connect_port,
-    )
-    if not interface_ipv4:
-        LOGGER.critical("Could not determine the outbound IPv4 interface")
+    try:
+        interface_by_upstream = resolve_upstream_interfaces(config.upstreams)
+        windivert_filter = build_windivert_filter(interface_by_upstream)
+    except (RuntimeError, ValueError) as exc:
+        LOGGER.critical("Route validation failed: %s", exc)
+        return 1
+
+    if args.check_config:
+        print(
+            "Configuration OK: "
+            f"{len(config.routes)} route(s), "
+            f"{len(config.upstreams)} upstream(s), "
+            f"{len(set(interface_by_upstream.values()))} outbound interface(s)"
+        )
+        return 0
+
+    try:
+        from fake_tcp import FakeTcpInjector
+    except ImportError as exc:
+        LOGGER.critical("Runtime dependency unavailable: %s", exc)
         return 1
 
     registry: ConnectionRegistry[FakeInjectiveConnection] = ConnectionRegistry()
     injector = FakeTcpInjector(
-        build_windivert_filter(interface_ipv4, config.upstreams),
+        windivert_filter,
         registry,
     )
     injector_thread = threading.Thread(
@@ -406,11 +573,14 @@ def run() -> int:
         )
         return 1
 
-    server = GatewayServer(config, interface_ipv4, registry)
+    server = GatewayServer(config, interface_by_upstream, registry)
     try:
-        asyncio.run(server.serve_forever())
+        asyncio.run(serve_until_shutdown(server))
     except KeyboardInterrupt:
         LOGGER.info("Shutdown requested")
+    except OSError as exc:
+        LOGGER.critical("Gateway stopped: %s", exc)
+        return 1
     return 0
 
 

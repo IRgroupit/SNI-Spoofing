@@ -5,7 +5,7 @@ import time
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 
-from app_config import UpstreamEndpoint
+from app_config import RouteConfig, UpstreamEndpoint
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,8 +46,7 @@ class RoutePool:
 
     def __init__(
         self,
-        upstreams: tuple[UpstreamEndpoint, ...],
-        fake_snis: tuple[str, ...],
+        routes: tuple[RouteConfig, ...],
         *,
         failure_threshold: int,
         cooldown_seconds: float,
@@ -56,10 +55,8 @@ class RoutePool:
         exploration_interval: int,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if not upstreams:
-            raise ValueError("upstreams must not be empty")
-        if not fake_snis:
-            raise ValueError("fake_snis must not be empty")
+        if not routes:
+            raise ValueError("routes must not be empty")
         if failure_threshold < 1:
             raise ValueError("failure_threshold must be positive")
         if cooldown_seconds <= 0:
@@ -71,9 +68,9 @@ class RoutePool:
         if exploration_interval < 2:
             raise ValueError("exploration_interval must be at least 2")
 
-        self._profiles = tuple(
-            RouteProfile(upstream, fake_sni) for upstream in upstreams for fake_sni in fake_snis
-        )
+        self._profiles = tuple(RouteProfile(route.upstream, route.fake_sni) for route in routes)
+        if len(set(self._profiles)) != len(self._profiles):
+            raise ValueError("routes must not contain duplicate route profiles")
         self._states = {profile: _RouteState() for profile in self._profiles}
         self._index = {profile: index for index, profile in enumerate(self._profiles)}
         self._failure_threshold = failure_threshold
