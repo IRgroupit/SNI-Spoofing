@@ -28,6 +28,9 @@ class RoutePoolTests(unittest.TestCase):
             ("decoy.example",),
             failure_threshold=2,
             cooldown_seconds=30.0,
+            max_cooldown_seconds=120.0,
+            latency_alpha=0.5,
+            exploration_interval=16,
             clock=self.clock,
         )
 
@@ -73,6 +76,48 @@ class RoutePoolTests(unittest.TestCase):
         self.assertEqual(snapshot.cooldown_remaining_seconds, 0.0)
         self.assertEqual(snapshot.total_successes, 1)
         self.assertEqual(snapshot.total_failures, 1)
+
+    def test_prefers_lower_latency_after_every_route_is_probed(self) -> None:
+        fast = self.pool.acquire()
+        self.assertIsNotNone(fast)
+        self.pool.record_success(fast, latency_seconds=0.02)
+        self.pool.release(fast)
+
+        slow = self.pool.acquire()
+        self.assertIsNotNone(slow)
+        self.assertNotEqual(fast, slow)
+        self.pool.record_success(slow, latency_seconds=0.2)
+        self.pool.release(slow)
+
+        self.assertEqual(self.pool.acquire(), fast)
+        fast_snapshot = next(item for item in self.pool.snapshots() if item.profile == fast)
+        self.assertEqual(fast_snapshot.ewma_latency_ms, 20.0)
+
+    def test_half_open_failure_doubles_cooldown(self) -> None:
+        profile = self.pool.acquire()
+        self.assertIsNotNone(profile)
+        other = next(item.profile for item in self.pool.snapshots() if item.profile != profile)
+        self.pool.release(profile)
+
+        self.pool.record_failure(profile)
+        self.pool.record_failure(profile)
+        self.clock.advance(31.0)
+
+        self.assertEqual(self.pool.acquire({other}), profile)
+        self.pool.release(profile)
+        self.assertTrue(self.pool.record_failure(profile))
+        snapshot = next(item for item in self.pool.snapshots() if item.profile == profile)
+
+        self.assertEqual(snapshot.cooldown_remaining_seconds, 60.0)
+        self.assertEqual(snapshot.circuit_open_count, 2)
+
+    def test_returns_none_when_every_route_is_cooling_down(self) -> None:
+        profiles = [item.profile for item in self.pool.snapshots()]
+        for profile in profiles:
+            self.pool.record_failure(profile)
+            self.pool.record_failure(profile)
+
+        self.assertIsNone(self.pool.acquire())
 
     def test_excluding_every_route_returns_none(self) -> None:
         profiles = {item.profile for item in self.pool.snapshots()}

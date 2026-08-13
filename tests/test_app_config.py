@@ -26,6 +26,7 @@ class AppConfigTests(unittest.TestCase):
         self.assertEqual(config.fake_snis, ("aparat.com",))
         self.assertEqual(config.relay_buffer_size, 65536)
         self.assertEqual(config.max_route_attempts, 3)
+        self.assertEqual(str(config.allowed_client_cidrs[0]), "0.0.0.0/0")
 
     def test_supports_multiple_upstreams_and_compatibility_aliases(self) -> None:
         raw = valid_config()
@@ -53,6 +54,36 @@ class AppConfigTests(unittest.TestCase):
         ]
 
         with self.assertRaisesRegex(ConfigError, "duplicate"):
+            AppConfig.from_mapping(raw)
+
+    def test_parses_and_collapses_client_cidrs(self) -> None:
+        raw = valid_config()
+        raw["ALLOWED_CLIENT_CIDRS"] = [
+            "192.0.2.1/24",
+            "192.0.2.128/25",
+            "198.51.100.10",
+        ]
+
+        config = AppConfig.from_mapping(raw)
+
+        self.assertEqual(
+            tuple(str(network) for network in config.allowed_client_cidrs),
+            ("192.0.2.0/24", "198.51.100.10/32"),
+        )
+
+    def test_rejects_ipv6_client_cidr(self) -> None:
+        raw = valid_config()
+        raw["ALLOWED_CLIENT_CIDRS"] = ["2001:db8::/32"]
+
+        with self.assertRaisesRegex(ConfigError, "only IPv4"):
+            AppConfig.from_mapping(raw)
+
+    def test_rejects_max_cooldown_below_base_cooldown(self) -> None:
+        raw = valid_config()
+        raw["ROUTE_COOLDOWN_SECONDS"] = 60
+        raw["ROUTE_MAX_COOLDOWN_SECONDS"] = 30
+
+        with self.assertRaisesRegex(ConfigError, "between 60"):
             AppConfig.from_mapping(raw)
 
     def test_supports_legacy_fake_sni_key(self) -> None:
