@@ -1,49 +1,98 @@
+from __future__ import annotations
+
 import struct
 
 
+def _require_length(name: str, value: bytes, expected: int) -> None:
+    if len(value) != expected:
+        raise ValueError(f"{name} must be exactly {expected} bytes")
+
+
 class ClientHelloMaker:
-    tls_ch_template_str = "1603010200010001fc030341d5b549d9cd1adfa7296c8418d157dc7b624c842824ff493b9375bb48d34f2b20bf018bcc90a7c89a230094815ad0c15b736e38c01209d72d282cb5e2105328150024130213031301c02cc030c02bc02fcca9cca8c024c028c023c027009f009e006b006700ff0100018f0000000b00090000066d63692e6972000b000403000102000a00160014001d0017001e0019001801000101010201030104002300000010000e000c02683208687474702f312e310016000000170000000d002a0028040305030603080708080809080a080b080408050806040105010601030303010302040205020602002b00050403040303002d00020101003300260024001d0020435bacc4d05f9d41fef44ab3ad55616c36e0613473e2338770efdaa98693d217001500d5000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    tls_ch_template_str = "1603010200010001fc030341d5b549d9cd1adfa7296c8418d157dc7b624c842824ff493b9375bb48d34f2b20bf018bcc90a7c89a230094815ad0c15b736e38c01209d72d282cb5e2105328150024130213031301c02cc030c02bc02fcca9cca8c024c028c023c027009f009e006b006700ff0100018f0000000b00090000066d63692e6972000b000403000102000a00160014001d0017001e0019001801000101010201030104002300000010000e000c02683208687474702f312e310016000000170000000d002a0028040305030603080708080809080a080b080408050806040105010601030303010302040205020602002b00050403040303002d00020101003300260024001d0020435bacc4d05f9d41fef44ab3ad55616c36e0613473e2338770efdaa98693d217001500d5000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
     tls_ch_template = bytes.fromhex(tls_ch_template_str)
-    template_sni = "mci.ir".encode()
+    template_sni = b"mci.ir"
     static1 = tls_ch_template[:11]
     static2 = b"\x20"
     static3 = tls_ch_template[76:120]
-    static4 = tls_ch_template[127 + len(template_sni):262 + len(template_sni)]
+    static4 = tls_ch_template[127 + len(template_sni) : 262 + len(template_sni)]
     static5 = b"\x00\x15"
-    ##############
     tls_change_cipher = b"\x14\x03\x03\x00\x01\x01"
     tls_app_data_header = b"\x17\x03\x03"
 
     @classmethod
-    def get_client_hello_with(cls, rnd: bytes, sess_id: bytes, target_sni: bytes,
-                              key_share: bytes) -> bytes:  # rnd,sess_id,key_share: 32 bytes
-        server_name_ext = struct.pack("!H", len(target_sni) + 5) + struct.pack("!H",
-                                                                               len(target_sni) + 3) + b"\x00" + struct.pack(
-            "!H", len(target_sni)) + target_sni
-        padding_ext = struct.pack("!H", 219 - len(target_sni)) + (b"\x00" * (219 - len(target_sni)))
-        return cls.static1 + rnd + cls.static2 + sess_id + cls.static3 + server_name_ext + cls.static4 + key_share + cls.static5 + padding_ext
-        # rnd-> [11:43)  sess_id-> [44:76) key_share-> [262+len(target_sni):294+len(target_sni))
+    def get_client_hello_with(
+        cls, rnd: bytes, sess_id: bytes, target_sni: bytes, key_share: bytes
+    ) -> bytes:
+        _require_length("rnd", rnd, 32)
+        _require_length("sess_id", sess_id, 32)
+        _require_length("key_share", key_share, 32)
+        if not target_sni or len(target_sni) > 219:
+            raise ValueError("target_sni must contain between 1 and 219 bytes")
+        try:
+            target_sni.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError("target_sni must be ASCII/IDNA encoded") from exc
+
+        server_name_ext = (
+            struct.pack("!H", len(target_sni) + 5)
+            + struct.pack("!H", len(target_sni) + 3)
+            + b"\x00"
+            + struct.pack("!H", len(target_sni))
+            + target_sni
+        )
+        padding_length = 219 - len(target_sni)
+        padding_ext = struct.pack("!H", padding_length) + (b"\x00" * padding_length)
+        result = (
+            cls.static1
+            + rnd
+            + cls.static2
+            + sess_id
+            + cls.static3
+            + server_name_ext
+            + cls.static4
+            + key_share
+            + cls.static5
+            + padding_ext
+        )
+        if len(result) != 517:
+            raise ValueError("Generated ClientHello has an unexpected length")
+        return result
 
     @classmethod
-    def parse_client_hello(cls, client_hello_bytes: bytes):
-        assert len(client_hello_bytes) == 517
+    def parse_client_hello(cls, client_hello_bytes: bytes) -> tuple[bytes, bytes, str, bytes]:
+        if len(client_hello_bytes) != 517:
+            raise ValueError("ClientHello must be exactly 517 bytes")
         rnd = client_hello_bytes[11:43]
         sess_id = client_hello_bytes[44:76]
-        tls_sni = client_hello_bytes[127:127 + (struct.unpack("!H", client_hello_bytes[125:127])[0])].decode()
-        ks_ind = 262 + len(tls_sni)
-        key_share = client_hello_bytes[ks_ind:ks_ind + 32]
-        assert cls.get_client_hello_with(rnd, sess_id, tls_sni, key_share) == client_hello_bytes
+        sni_length = struct.unpack("!H", client_hello_bytes[125:127])[0]
+        try:
+            tls_sni = client_hello_bytes[127 : 127 + sni_length].decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError("ClientHello contains a non-ASCII SNI") from exc
+        key_share_index = 262 + len(tls_sni)
+        key_share = client_hello_bytes[key_share_index : key_share_index + 32]
+        expected = cls.get_client_hello_with(rnd, sess_id, tls_sni.encode("ascii"), key_share)
+        if expected != client_hello_bytes:
+            raise ValueError("ClientHello does not match the supported template")
         return rnd, sess_id, tls_sni, key_share
 
     @classmethod
-    def get_client_response_with(cls, app_data1: bytes):
-        return cls.tls_change_cipher + cls.tls_app_data_header + struct.pack("!H", len(app_data1)) + app_data1
+    def get_client_response_with(cls, app_data1: bytes) -> bytes:
+        return (
+            cls.tls_change_cipher
+            + cls.tls_app_data_header
+            + struct.pack("!H", len(app_data1))
+            + app_data1
+        )
 
     @classmethod
-    def parse_client_response(cls, client_response_bytes: bytes):
-        assert len(client_response_bytes) >= 32
+    def parse_client_response(cls, client_response_bytes: bytes) -> bytes:
+        if len(client_response_bytes) < 11:
+            raise ValueError("Client response is too short")
         app_data1 = client_response_bytes[11:]
-        assert cls.get_client_response_with(app_data1) == client_response_bytes
+        if cls.get_client_response_with(app_data1) != client_response_bytes:
+            raise ValueError("Client response does not match the supported template")
         return app_data1
 
 
@@ -57,16 +106,33 @@ class ServerHelloMaker:
     tls_app_data_header = b"\x17\x03\x03"
 
     @classmethod
-    def get_server_hello_with(cls, rnd: bytes, sess_id: bytes, key_share: bytes, app_data1: bytes):
-        return cls.static1 + rnd + cls.static2 + sess_id + cls.static3 + key_share + cls.tls_change_cipher + cls.tls_app_data_header + struct.pack(
-            "!H", len(app_data1)) + app_data1
+    def get_server_hello_with(
+        cls, rnd: bytes, sess_id: bytes, key_share: bytes, app_data1: bytes
+    ) -> bytes:
+        _require_length("rnd", rnd, 32)
+        _require_length("sess_id", sess_id, 32)
+        _require_length("key_share", key_share, 32)
+        return (
+            cls.static1
+            + rnd
+            + cls.static2
+            + sess_id
+            + cls.static3
+            + key_share
+            + cls.tls_change_cipher
+            + cls.tls_app_data_header
+            + struct.pack("!H", len(app_data1))
+            + app_data1
+        )
 
     @classmethod
-    def parse_server_hello(cls, server_hello_bytes: bytes):
-        assert len(server_hello_bytes) >= 159
+    def parse_server_hello(cls, server_hello_bytes: bytes) -> tuple[bytes, bytes, bytes, bytes]:
+        if len(server_hello_bytes) < 138:
+            raise ValueError("ServerHello is too short")
         rnd = server_hello_bytes[11:43]
         sess_id = server_hello_bytes[44:76]
         key_share = server_hello_bytes[95:127]
         app_data1 = server_hello_bytes[138:]
-        assert cls.get_server_hello_with(rnd, sess_id, key_share, app_data1) == server_hello_bytes
+        if cls.get_server_hello_with(rnd, sess_id, key_share, app_data1) != server_hello_bytes:
+            raise ValueError("ServerHello does not match the supported template")
         return rnd, sess_id, key_share, app_data1
