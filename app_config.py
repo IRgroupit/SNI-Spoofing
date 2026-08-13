@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 from dataclasses import dataclass
+from ipaddress import IPv4Network
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ class UpstreamEndpoint:
 class AppConfig:
     listen_host: str
     listen_port: int
+    allowed_client_cidrs: tuple[IPv4Network, ...]
     upstreams: tuple[UpstreamEndpoint, ...]
     fake_snis: tuple[str, ...]
     bypass_method: str
@@ -34,6 +36,10 @@ class AppConfig:
     max_route_attempts: int
     route_failure_threshold: int
     route_cooldown_seconds: float
+    route_max_cooldown_seconds: float
+    route_latency_alpha: float
+    route_exploration_interval: int
+    metrics_interval_seconds: float
     relay_buffer_size: int
     max_connections: int
     max_connections_per_ip: int
@@ -84,10 +90,25 @@ class AppConfig:
 
         max_connections = _integer(raw, "MAX_CONNECTIONS", 2048, 1, 65535)
         max_connections_per_ip = _integer(raw, "MAX_CONNECTIONS_PER_IP", 64, 1, max_connections)
+        route_cooldown_seconds = _number(
+            raw,
+            "ROUTE_COOLDOWN_SECONDS",
+            30.0,
+            1.0,
+            3600.0,
+        )
+        route_max_cooldown_seconds = _number(
+            raw,
+            "ROUTE_MAX_COOLDOWN_SECONDS",
+            max(300.0, route_cooldown_seconds),
+            route_cooldown_seconds,
+            86400.0,
+        )
 
         return cls(
             listen_host=listen_host,
             listen_port=_integer(raw, "LISTEN_PORT", None, 1, 65535),
+            allowed_client_cidrs=_ipv4_networks(raw),
             upstreams=upstreams,
             fake_snis=fake_snis,
             bypass_method=bypass_method,
@@ -96,11 +117,21 @@ class AppConfig:
             idle_timeout_seconds=_number(raw, "IDLE_TIMEOUT_SECONDS", 180.0, 5.0, 86400.0),
             max_route_attempts=_integer(raw, "MAX_ROUTE_ATTEMPTS", 3, 1, 64),
             route_failure_threshold=_integer(raw, "ROUTE_FAILURE_THRESHOLD", 2, 1, 100),
-            route_cooldown_seconds=_number(
+            route_cooldown_seconds=route_cooldown_seconds,
+            route_max_cooldown_seconds=route_max_cooldown_seconds,
+            route_latency_alpha=_number(raw, "ROUTE_LATENCY_ALPHA", 0.2, 0.01, 1.0),
+            route_exploration_interval=_integer(
                 raw,
-                "ROUTE_COOLDOWN_SECONDS",
-                30.0,
-                1.0,
+                "ROUTE_EXPLORATION_INTERVAL",
+                16,
+                2,
+                10000,
+            ),
+            metrics_interval_seconds=_number(
+                raw,
+                "METRICS_INTERVAL_SECONDS",
+                60.0,
+                0.0,
                 3600.0,
             ),
             relay_buffer_size=_integer(raw, "RELAY_BUFFER_SIZE", 65536, 4096, 1024 * 1024),
@@ -126,6 +157,28 @@ def load_config(path: str | Path) -> AppConfig:
     if not isinstance(raw, dict):
         raise ConfigError("config.json root must be a JSON object")
     return AppConfig.from_mapping(raw)
+
+
+def _ipv4_networks(raw: dict[str, Any]) -> tuple[IPv4Network, ...]:
+    values = raw.get("ALLOWED_CLIENT_CIDRS", ["0.0.0.0/0"])
+    if not isinstance(values, list) or not values:
+        raise ConfigError("ALLOWED_CLIENT_CIDRS must be a non-empty JSON array")
+    if len(values) > 256:
+        raise ConfigError("ALLOWED_CLIENT_CIDRS must not contain more than 256 entries")
+
+    networks: list[IPv4Network] = []
+    for index, value in enumerate(values):
+        if not isinstance(value, str):
+            raise ConfigError(f"ALLOWED_CLIENT_CIDRS[{index}] must be a CIDR string")
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError as exc:
+            raise ConfigError(f"Invalid CIDR in ALLOWED_CLIENT_CIDRS[{index}]: {value!r}") from exc
+        if network.version != 4:
+            raise ConfigError("ALLOWED_CLIENT_CIDRS supports only IPv4 in this release")
+        networks.append(network)
+
+    return tuple(ipaddress.collapse_addresses(networks))
 
 
 def _upstreams(raw: dict[str, Any]) -> tuple[UpstreamEndpoint, ...]:

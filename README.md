@@ -17,6 +17,9 @@
 - لاگ استاندارد و بدون ثبت Payload کاربران
 - Route pool تطبیقی با failover، least-loaded selection و circuit breaker
 - پشتیبانی از چند Upstream و چند Decoy SNI با حفظ تنظیمات قدیمی
+- انتخاب مسیر با EWMA latency، exploration دوره‌ای و امتیاز reliability/load
+- cooldown نمایی برای جلوگیری از retry storm هنگام قطعی مسیر
+- Client CIDR allowlist و metricهای تجمیعی بدون Payload یا IP کاربر
 - تست Regression و CI ویندوز روی Python 3.10 تا 3.13
 
 ## پیش‌نیازها
@@ -40,6 +43,7 @@ py main.py
 {
   "LISTEN_HOST": "0.0.0.0",
   "LISTEN_PORT": 40443,
+  "ALLOWED_CLIENT_CIDRS": ["0.0.0.0/0"],
   "UPSTREAMS": [
     {"IP": "188.114.98.0", "PORT": 443}
   ],
@@ -51,6 +55,10 @@ py main.py
   "MAX_ROUTE_ATTEMPTS": 3,
   "ROUTE_FAILURE_THRESHOLD": 2,
   "ROUTE_COOLDOWN_SECONDS": 30,
+  "ROUTE_MAX_COOLDOWN_SECONDS": 300,
+  "ROUTE_LATENCY_ALPHA": 0.2,
+  "ROUTE_EXPLORATION_INTERVAL": 16,
+  "METRICS_INTERVAL_SECONDS": 60,
   "RELAY_BUFFER_SIZE": 131072,
   "MAX_CONNECTIONS": 2048,
   "MAX_CONNECTIONS_PER_IP": 64,
@@ -63,7 +71,9 @@ py main.py
 
 ### Failover تطبیقی
 
-برنامه از ترکیب هر عضو `UPSTREAMS` با هر عضو `FAKE_SNIS` یک Route Profile می‌سازد. انتخاب مسیر به‌شکل round-robin بین کم‌بارترین مسیرهای سالم انجام می‌شود. خطاهای اتصال یا Injection به‌صورت passive ثبت می‌شوند و بعد از `ROUTE_FAILURE_THRESHOLD` شکست متوالی، مسیر برای `ROUTE_COOLDOWN_SECONDS` وارد cooldown می‌شود. هر اتصال جدید حداکثر `MAX_ROUTE_ATTEMPTS` مسیر متفاوت را قبل از بستن Client امتحان می‌کند.
+برنامه از ترکیب هر عضو `UPSTREAMS` با هر عضو `FAKE_SNIS` یک Route Profile می‌سازد. انتخاب مسیر با ترکیب تعداد اتصال فعال، EWMA زمان connect/injection و نرخ موفقیت انجام می‌شود. یک exploration کنترل‌شده هم مانع starvation مسیرهای کم‌استفاده می‌شود.
+
+خطاهای اتصال یا Injection به‌صورت passive ثبت می‌شوند. بعد از `ROUTE_FAILURE_THRESHOLD` شکست متوالی، circuit مسیر باز می‌شود. cooldown از `ROUTE_COOLDOWN_SECONDS` شروع می‌شود و در شکست‌های half-open تا سقف `ROUTE_MAX_COOLDOWN_SECONDS` به‌صورت نمایی افزایش پیدا می‌کند. وقتی همه مسیرها در cooldown هستند، اتصال fail-fast می‌شود تا retry storm ایجاد نشود. هر Client حداکثر `MAX_ROUTE_ATTEMPTS` مسیر متفاوت را امتحان می‌کند.
 
 برای failover واقعی باید حداقل دو Endpoint معتبر یا دو پروفایل تست‌شده داشته باشید. تنظیم پیش‌فرض فقط یک Upstream و یک SNI دارد و طبیعتاً مسیر جایگزین ایجاد نمی‌کند. IP تصادفی Cloudflare اضافه نکنید؛ هر Upstream باید واقعاً سرویس مقصد شما را terminate کند.
 
@@ -76,6 +86,21 @@ py main.py
 ### هشدار Listener عمومی
 
 گوش‌دادن روی `0.0.0.0` یعنی پورت روی همه Interfaceها باز می‌شود. حتی با وجود محدودیت داخلی، در محیط عملیاتی باید پورت `40443/TCP` را در Firewall فقط برای IP/CIDR کاربران مجاز Allow کنید.
+
+`ALLOWED_CLIENT_CIDRS` یک لایه Admission داخل برنامه است. مقدار پیش‌فرض `0.0.0.0/0` برای حفظ رفتار قبلی همه را مجاز می‌کند و **Open Listener** است؛ برای Production آن را با CIDRهای واقعی کاربران یا شبکه‌ی ورودی عوض کنید. این کنترل جای احراز هویت لایه Tunnel یا Firewall را نمی‌گیرد.
+
+نمونه محدودسازی:
+
+```json
+{
+  "ALLOWED_CLIENT_CIDRS": [
+    "198.51.100.24/32",
+    "203.0.113.0/28"
+  ]
+}
+```
+
+هر `METRICS_INTERVAL_SECONDS` ثانیه یک رکورد `gateway_metrics` در Log نوشته می‌شود: تعداد اتصال فعال/پذیرفته/ردشده و وضعیت هر Route شامل success، failure، cooldown و EWMA latency. Payload، SNI واقعی کاربر یا IP Client در این رکورد ذخیره نمی‌شود. مقدار `0` گزارش دوره‌ای را غیرفعال می‌کند.
 
 ## تست توسعه
 

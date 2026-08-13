@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
 import sys
 import threading
+import time
 from pathlib import Path
 
 from app_config import AppConfig, ConfigError, UpstreamEndpoint, load_config
+from client_allowlist import ClientAllowlist
 from connection_limits import ConnectionLimiter
 from connection_registry import ConnectionRegistry
 from fake_tcp import FakeInjectiveConnection, FakeTcpInjector
@@ -88,6 +91,7 @@ class GatewayServer:
         self.config = config
         self.interface_ipv4 = interface_ipv4
         self.registry = registry
+        self.client_allowlist = ClientAllowlist(config.allowed_client_cidrs)
         self.limiter = ConnectionLimiter(
             config.max_connections,
             config.max_connections_per_ip,
@@ -97,8 +101,15 @@ class GatewayServer:
             config.fake_snis,
             failure_threshold=config.route_failure_threshold,
             cooldown_seconds=config.route_cooldown_seconds,
+            max_cooldown_seconds=config.route_max_cooldown_seconds,
+            latency_alpha=config.route_latency_alpha,
+            exploration_interval=config.route_exploration_interval,
         )
         self.tasks: set[asyncio.Task[None]] = set()
+        self.started_at = time.monotonic()
+        self.accepted_connections = 0
+        self.denied_connections = 0
+        self.limit_rejections = 0
 
     async def _open_route(
         self,
@@ -164,10 +175,17 @@ class GatewayServer:
         remote_address: tuple[str, int],
     ) -> None:
         client_ip = remote_address[0]
+        if not self.client_allowlist.allows(client_ip):
+            self.denied_connections += 1
+            LOGGER.debug("Rejected client outside ALLOWED_CLIENT_CIDRS")
+            close_socket(incoming_sock)
+            return
         if not self.limiter.try_acquire(client_ip):
+            self.limit_rejections += 1
             LOGGER.warning("Connection limit reached for client %s", client_ip)
             close_socket(incoming_sock)
             return
+        self.accepted_connections += 1
 
         outgoing_sock: socket.socket | None = None
         active_route: RouteProfile | None = None
@@ -185,6 +203,7 @@ class GatewayServer:
                     break
                 attempted_routes.add(route)
                 active_route = route
+                route_started_at = time.monotonic()
                 try:
                     outgoing_sock = await self._open_route(route)
                 except (ConnectionError, OSError, TimeoutError, ValueError) as exc:
@@ -202,7 +221,10 @@ class GatewayServer:
                     )
                     continue
 
-                self.route_pool.record_success(route)
+                self.route_pool.record_success(
+                    route,
+                    latency_seconds=time.monotonic() - route_started_at,
+                )
                 LOGGER.debug("Selected route %s after %d attempt(s)", route.label, attempt)
                 break
 
@@ -230,6 +252,44 @@ class GatewayServer:
             close_socket(incoming_sock)
             self.limiter.release(client_ip)
 
+    async def report_metrics_forever(self) -> None:
+        while True:
+            await asyncio.sleep(self.config.metrics_interval_seconds)
+            route_metrics = []
+            for snapshot in self.route_pool.snapshots():
+                route_metrics.append(
+                    {
+                        "route": snapshot.profile.label,
+                        "active": snapshot.active,
+                        "successes": snapshot.total_successes,
+                        "failures": snapshot.total_failures,
+                        "consecutive_failures": snapshot.consecutive_failures,
+                        "circuit_open_count": snapshot.circuit_open_count,
+                        "cooldown_seconds": round(snapshot.cooldown_remaining_seconds, 3),
+                        "ewma_latency_ms": (
+                            round(snapshot.ewma_latency_ms, 3)
+                            if snapshot.ewma_latency_ms is not None
+                            else None
+                        ),
+                    }
+                )
+
+            LOGGER.info(
+                "gateway_metrics=%s",
+                json.dumps(
+                    {
+                        "uptime_seconds": round(time.monotonic() - self.started_at, 3),
+                        "active_connections": self.limiter.active,
+                        "accepted_connections": self.accepted_connections,
+                        "denied_connections": self.denied_connections,
+                        "limit_rejections": self.limit_rejections,
+                        "routes": route_metrics,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+
     async def serve_forever(self) -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setblocking(False)
@@ -249,8 +309,19 @@ class GatewayServer:
                 "Public listener enabled; restrict port %d with a firewall to trusted clients",
                 self.config.listen_port,
             )
+        if self.client_allowlist.allows_all:
+            LOGGER.warning(
+                "ALLOWED_CLIENT_CIDRS permits every IPv4 address; this listener has no client "
+                "authentication"
+            )
 
         loop = asyncio.get_running_loop()
+        metrics_task: asyncio.Task[None] | None = None
+        if self.config.metrics_interval_seconds > 0:
+            metrics_task = asyncio.create_task(
+                self.report_metrics_forever(),
+                name="route-metrics",
+            )
         try:
             while True:
                 incoming_sock, remote_address = await loop.sock_accept(listener)
@@ -264,6 +335,9 @@ class GatewayServer:
             for task in active_tasks:
                 task.cancel()
             await asyncio.gather(*active_tasks, return_exceptions=True)
+            if metrics_task is not None:
+                metrics_task.cancel()
+                await asyncio.gather(metrics_task, return_exceptions=True)
 
 
 def get_executable_directory() -> Path:
