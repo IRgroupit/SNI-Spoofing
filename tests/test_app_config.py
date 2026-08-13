@@ -24,7 +24,9 @@ class AppConfigTests(unittest.TestCase):
 
         self.assertEqual(config.listen_host, "0.0.0.0")
         self.assertEqual(config.fake_snis, ("aparat.com",))
+        self.assertEqual(len(config.routes), 1)
         self.assertEqual(config.relay_buffer_size, 65536)
+        self.assertEqual(config.shutdown_grace_seconds, 30.0)
         self.assertEqual(config.max_route_attempts, 3)
         self.assertEqual(str(config.allowed_client_cidrs[0]), "0.0.0.0/0")
 
@@ -45,6 +47,45 @@ class AppConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.connect_ip, "192.0.2.10")
         self.assertEqual(config.connect_port, 443)
+
+    def test_explicit_routes_preserve_endpoint_sni_pairing(self) -> None:
+        raw = {
+            "LISTEN_HOST": "0.0.0.0",
+            "LISTEN_PORT": 40443,
+            "ROUTES": [
+                {"IP": "192.0.2.10", "PORT": 443, "FAKE_SNI": "one.example"},
+                {"IP": "192.0.2.20", "PORT": 8443, "FAKE_SNI": "two.example"},
+            ],
+        }
+
+        config = AppConfig.from_mapping(raw)
+
+        self.assertEqual(
+            tuple(route.label for route in config.routes),
+            (
+                "192.0.2.10:443 via one.example",
+                "192.0.2.20:8443 via two.example",
+            ),
+        )
+        self.assertEqual(config.fake_snis, ("one.example", "two.example"))
+
+    def test_rejects_explicit_routes_mixed_with_legacy_keys(self) -> None:
+        raw = valid_config()
+        raw["ROUTES"] = [{"IP": "192.0.2.10", "PORT": 443, "FAKE_SNI": "one.example"}]
+
+        with self.assertRaisesRegex(ConfigError, "cannot be combined"):
+            AppConfig.from_mapping(raw)
+
+    def test_rejects_duplicate_explicit_routes(self) -> None:
+        route = {"IP": "192.0.2.10", "PORT": 443, "FAKE_SNI": "one.example"}
+        raw = {
+            "LISTEN_HOST": "0.0.0.0",
+            "LISTEN_PORT": 40443,
+            "ROUTES": [route, route.copy()],
+        }
+
+        with self.assertRaisesRegex(ConfigError, "duplicate"):
+            AppConfig.from_mapping(raw)
 
     def test_rejects_duplicate_upstreams(self) -> None:
         raw = valid_config()

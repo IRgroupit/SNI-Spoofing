@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app_config import UpstreamEndpoint
+from app_config import RouteConfig, UpstreamEndpoint
 from route_pool import RoutePool
 
 
@@ -22,10 +22,9 @@ class RoutePoolTests(unittest.TestCase):
         self.clock = FakeClock()
         self.pool = RoutePool(
             (
-                UpstreamEndpoint("192.0.2.10", 443),
-                UpstreamEndpoint("192.0.2.20", 443),
+                RouteConfig(UpstreamEndpoint("192.0.2.10", 443), "one.example"),
+                RouteConfig(UpstreamEndpoint("192.0.2.20", 443), "two.example"),
             ),
-            ("decoy.example",),
             failure_threshold=2,
             cooldown_seconds=30.0,
             max_cooldown_seconds=120.0,
@@ -46,6 +45,17 @@ class RoutePoolTests(unittest.TestCase):
         self.pool.release(first)
         self.pool.release(second)
         self.assertEqual(sum(item.active for item in self.pool.snapshots()), 0)
+
+    def test_uses_only_explicit_endpoint_sni_pairs(self) -> None:
+        labels = {snapshot.profile.label for snapshot in self.pool.snapshots()}
+
+        self.assertEqual(
+            labels,
+            {
+                "192.0.2.10:443 via one.example",
+                "192.0.2.20:443 via two.example",
+            },
+        )
 
     def test_circuit_breaker_skips_failed_route_until_cooldown_expires(self) -> None:
         failed = self.pool.acquire()
