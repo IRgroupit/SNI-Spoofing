@@ -23,7 +23,22 @@ def configure_tcp_socket(
 ) -> None:
     """Apply portable TCP keepalive settings, skipping unavailable OS options."""
 
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+    sio_keepalive_vals = getattr(socket, "SIO_KEEPALIVE_VALS", None)
+    if sio_keepalive_vals is not None and hasattr(sock, "ioctl"):
+        try:
+            sock.ioctl(
+                sio_keepalive_vals,
+                (1, keep_idle * 1000, keep_interval * 1000),
+            )
+        except OSError:
+            pass
+
     for option_name, value in (
         ("TCP_KEEPIDLE", keep_idle),
         ("TCP_KEEPINTVL", keep_interval),
