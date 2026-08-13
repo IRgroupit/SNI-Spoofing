@@ -12,10 +12,25 @@ if "pydivert" not in sys.modules:
     pydivert_stub.WinDivert = object
     sys.modules["pydivert"] = pydivert_stub
 
-from main import relay_one_way  # noqa: E402
+from app_config import UpstreamEndpoint  # noqa: E402
+from main import build_windivert_filter, relay_one_way  # noqa: E402
 
 
 class RelayTests(unittest.TestCase):
+    def test_windivert_filter_covers_every_upstream_and_port(self) -> None:
+        result = build_windivert_filter(
+            "192.0.2.1",
+            (
+                UpstreamEndpoint("198.51.100.10", 443),
+                UpstreamEndpoint("198.51.100.20", 8443),
+            ),
+        )
+
+        self.assertIn("ip.DstAddr == 198.51.100.10", result)
+        self.assertIn("tcp.DstPort == 443", result)
+        self.assertIn("ip.SrcAddr == 198.51.100.20", result)
+        self.assertIn("tcp.SrcPort == 8443", result)
+
     def test_relay_sends_payload_without_false_incomplete_send(self) -> None:
         asyncio.run(self._exercise_relay())
 

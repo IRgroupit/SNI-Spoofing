@@ -25,6 +25,35 @@ class AppConfigTests(unittest.TestCase):
         self.assertEqual(config.listen_host, "0.0.0.0")
         self.assertEqual(config.fake_snis, ("aparat.com",))
         self.assertEqual(config.relay_buffer_size, 65536)
+        self.assertEqual(config.max_route_attempts, 3)
+
+    def test_supports_multiple_upstreams_and_compatibility_aliases(self) -> None:
+        raw = valid_config()
+        raw.pop("CONNECT_IP")
+        raw.pop("CONNECT_PORT")
+        raw["UPSTREAMS"] = [
+            {"IP": "192.0.2.10", "PORT": 443},
+            {"IP": "192.0.2.20", "PORT": 8443},
+        ]
+
+        config = AppConfig.from_mapping(raw)
+
+        self.assertEqual(
+            tuple(endpoint.label for endpoint in config.upstreams),
+            ("192.0.2.10:443", "192.0.2.20:8443"),
+        )
+        self.assertEqual(config.connect_ip, "192.0.2.10")
+        self.assertEqual(config.connect_port, 443)
+
+    def test_rejects_duplicate_upstreams(self) -> None:
+        raw = valid_config()
+        raw["UPSTREAMS"] = [
+            {"IP": "192.0.2.10", "PORT": 443},
+            {"IP": "192.0.2.10", "PORT": 443},
+        ]
+
+        with self.assertRaisesRegex(ConfigError, "duplicate"):
+            AppConfig.from_mapping(raw)
 
     def test_supports_legacy_fake_sni_key(self) -> None:
         raw = valid_config()
